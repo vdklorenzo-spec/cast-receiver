@@ -1,177 +1,400 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>AnalogToWifiSpeakers Receiver</title>
+package com.example.analogtowifispeakers
 
-  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+import java.io.BufferedOutputStream
+import java.io.BufferedReader
+import java.io.OutputStream
+import java.io.InputStreamReader
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
-  <style>
-    body {
-      margin: 0;
-      background: black;
-      color: white;
-      font-family: sans-serif;
-      text-align: center;
+class LocalHttpServer(
+    private val port: Int = 9090
+) {
+    private data class Client(
+        val socket: Socket,
+        val out: OutputStream
+    )
+
+    private var serverSocket: ServerSocket? = null
+    private val running = AtomicBoolean(false)
+    private val clients = CopyOnWriteArrayList<Client>()
+
+    fun start() {
+        if (running.get()) return
+        running.set(true)
+
+        serverSocket = ServerSocket(port)
+
+        thread(name = "LocalHttpServer-Accept", isDaemon = true) {
+            while (running.get()) {
+                try {
+                    val client = serverSocket?.accept() ?: break
+                    handleClientAsync(client)
+                } catch (_: Throwable) {
+                    // ignore accept errors during stop()
+                }
+            }
+        }
     }
 
-    .wrap {
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 16px;
+    fun stop() {
+        running.set(false)
+        try { serverSocket?.close() } catch (_: Throwable) {}
+        serverSocket = null
+
+        for (c in clients) {
+            try { c.out.flush() } catch (_: Throwable) {}
+            try { c.socket.close() } catch (_: Throwable) {}
+        }
+        clients.clear()
     }
 
-    h2 {
-      margin: 0;
-      font-size: 32px;
-    }
+    fun isRunning(): Boolean = running.get()
 
-    p {
-      margin: 0;
-      font-size: 20px;
-      opacity: 0.85;
-    }
+    fun pushAacFrame(frame: ByteArray) {
+        if (!running.get()) return
+        if (frame.isEmpty()) return
+        if (clients.isEmpty()) return
 
-    audio {
-      width: 420px;
-      max-width: 90vw;
-    }
+        val chunkHeader = (frame.size.toString(16) + "\r\n").toByteArray(Charsets.US_ASCII)
+        val chunkFooter = "\r\n".toByteArray(Charsets.US_ASCII)
 
-    .small {
-      font-size: 16px;
-      opacity: 0.65;
-      max-width: 90vw;
-      word-break: break-all;
-    }
-  </style>
-</head>
+        val toRemove = ArrayList<Client>()
 
-<body>
-  <div class="wrap">
-    <h2>AnalogToWifiSpeakers Receiver</h2>
-    <p id="status">Waiting for stream...</p>
-    <audio id="player" autoplay controls></audio>
-    <div id="info" class="small"></div>
-  </div>
-
-  <script>
-    const context = cast.framework.CastReceiverContext.getInstance();
-    const playerManager = context.getPlayerManager();
-    const player = document.getElementById("player");
-    const statusEl = document.getElementById("status");
-    const infoEl = document.getElementById("info");
-
-    function setStatus(text) {
-      statusEl.textContent = text;
-      console.log("[Receiver] " + text);
-    }
-
-    function setInfo(text) {
-      infoEl.textContent = text || "";
-      if (text) {
-        console.log("[Receiver] " + text);
-      }
-    }
-
-    function stopHtmlAudio() {
-      try {
-        player.pause();
-      } catch (_) {}
-
-      try {
-        player.removeAttribute("src");
-        player.load();
-      } catch (_) {}
-    }
-
-    async function playHtmlAudio(streamUrl, title) {
-      stopHtmlAudio();
-
-      player.src = streamUrl;
-      player.autoplay = true;
-      player.crossOrigin = "anonymous";
-
-      setStatus("Loading direct HTML audio...");
-      setInfo(streamUrl);
-
-      try {
-        await player.play();
-        setStatus(title ? `Playing: ${title}` : "Playing direct HTML audio");
-      } catch (err) {
-        console.error("[Receiver] player.play() failed:", err);
-        setStatus("Play failed");
-        setInfo(String(err));
-      }
-    }
-
-    player.addEventListener("playing", () => {
-      console.log("[Receiver] HTML audio playing");
-    });
-
-    player.addEventListener("waiting", () => {
-      console.log("[Receiver] HTML audio waiting/buffering");
-    });
-
-    player.addEventListener("error", () => {
-      const mediaError = player.error;
-      console.error("[Receiver] HTML audio error:", mediaError);
-      setStatus("Audio error");
-      setInfo(mediaError ? `code=${mediaError.code}` : "unknown");
-    });
-
-    playerManager.setMessageInterceptor(
-      cast.framework.messages.MessageType.LOAD,
-      (loadRequestData) => {
-        console.log("[Receiver] LOAD intercepted", loadRequestData);
-
-        const customData = loadRequestData && loadRequestData.customData;
-        const media = loadRequestData && loadRequestData.media;
-        const streamUrl =
-          (customData && customData.streamUrl) ||
-          (media && media.contentId) ||
-          "";
-
-        const title =
-          (customData && customData.title) ||
-          (media && media.metadata && media.metadata.title) ||
-          "Analog to WiFi Speakers";
-
-        if (!streamUrl) {
-          setStatus("No stream URL received");
-          setInfo("");
-          console.log("[Receiver] No stream URL in request", loadRequestData);
-          return loadRequestData;
+        for (c in clients) {
+            try {
+                c.out.write(chunkHeader)
+                c.out.write(frame)
+                c.out.write(chunkFooter)
+                c.out.flush()
+            } catch (_: Throwable) {
+                toRemove.add(c)
+            }
         }
 
-        setStatus("Stream URL received: " + streamUrl);
-        console.log("[Receiver] Stream URL received:", streamUrl);
+        if (toRemove.isNotEmpty()) {
+            for (c in toRemove) {
+                clients.remove(c)
+                try { c.socket.close() } catch (_: Throwable) {}
+            }
+        }
+    }
 
-        playHtmlAudio(streamUrl, title);
+    private fun handleClientAsync(socket: Socket) {
+        thread(name = "LocalHttpServer-Client", isDaemon = true) {
+            socket.use { s ->
+                try {
+                    s.soTimeout = 0
+                    s.tcpNoDelay = true
 
-        setTimeout(() => {
-          setStatus("Playing stream");
-        }, 1000);
+                    val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                    val requestLine = reader.readLine() ?: return@thread
 
-        return null;
-      }
-    );
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isEmpty()) break
+                    }
 
-    playerManager.setMessageInterceptor(
-      cast.framework.messages.MessageType.STOP,
-      (requestData) => {
-        console.log("[Receiver] STOP intercepted");
-        stopHtmlAudio();
-        setStatus("Stopped");
-        setInfo("");
-        return requestData;
-      }
-    );
+                    val parts = requestLine.split(" ")
+                    val rawPath = parts.getOrNull(1) ?: "/"
+                    val path = rawPath.substringBefore("?")
 
-    context.start();
-    setStatus("Receiver ready");
-  </script>
-</body>
-</html>
+                    val out = BufferedOutputStream(s.getOutputStream())
+
+                    when {
+                        path == "/ping" -> respondPing(out)
+                        path == "/live.aac" -> registerLiveAacClient(s, out)
+                        path == "/receiver.html" -> respondReceiver(out)
+                        else -> respondNotFound(out)
+                    }
+                } catch (_: Throwable) {
+                    // client closed / etc.
+                }
+            }
+        }
+    }
+
+    private fun respondPing(out: BufferedOutputStream) {
+        val body = "OK"
+        val resp = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: text/plain\r\n")
+            append("Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n")
+            append("Connection: close\r\n")
+            append("\r\n")
+            append(body)
+        }
+        out.write(resp.toByteArray(Charsets.UTF_8))
+        out.flush()
+    }
+
+    private fun respondNotFound(out: BufferedOutputStream) {
+        val body = "Not Found"
+        val resp = buildString {
+            append("HTTP/1.1 404 Not Found\r\n")
+            append("Content-Type: text/plain\r\n")
+            append("Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n")
+            append("Connection: close\r\n")
+            append("\r\n")
+            append(body)
+        }
+        out.write(resp.toByteArray(Charsets.UTF_8))
+        out.flush()
+    }
+
+    private fun respondReceiver(out: BufferedOutputStream) {
+        val html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>AnalogToWifiSpeakers Receiver</title>
+
+              <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+              <style>
+                html, body {
+                  margin: 0;
+                  width: 100%;
+                  height: 100%;
+                  background: black;
+                  color: white;
+                  font-family: sans-serif;
+                }
+
+                .wrap {
+                  min-height: 100vh;
+                  display: flex;
+                  flex-direction: column;
+                  align-items: center;
+                  justify-content: center;
+                  gap: 16px;
+                  text-align: center;
+                  padding: 24px;
+                  box-sizing: border-box;
+                }
+
+                h2 {
+                  margin: 0;
+                  font-size: 32px;
+                }
+
+                p {
+                  margin: 0;
+                  font-size: 20px;
+                  opacity: 0.85;
+                }
+
+                audio {
+                  width: 420px;
+                  max-width: 90vw;
+                }
+
+                .small {
+                  font-size: 16px;
+                  opacity: 0.65;
+                  max-width: 90vw;
+                  word-break: break-all;
+                }
+              </style>
+            </head>
+
+            <body>
+              <div class="wrap">
+                <h2>AnalogToWifiSpeakers Receiver</h2>
+                <p id="status">Receiver booting...</p>
+                <audio id="player" autoplay controls></audio>
+                <div id="info" class="small"></div>
+              </div>
+
+              <script>
+                const context = cast.framework.CastReceiverContext.getInstance();
+                const playerManager = context.getPlayerManager();
+                const player = document.getElementById("player");
+                const statusEl = document.getElementById("status");
+                const infoEl = document.getElementById("info");
+
+                function setStatus(text) {
+                  statusEl.textContent = text;
+                  console.log("[Receiver] " + text);
+                }
+
+                function setInfo(text) {
+                  infoEl.textContent = text || "";
+                  if (text) {
+                    console.log("[Receiver] info:", text);
+                  }
+                }
+
+                function stopHtmlAudio() {
+                  try { player.pause(); } catch (_) {}
+                  try {
+                    player.removeAttribute("src");
+                    player.load();
+                  } catch (_) {}
+                }
+
+                async function playHtmlAudio(streamUrl, title) {
+                  stopHtmlAudio();
+
+                  player.src = streamUrl;
+                  player.autoplay = true;
+                  player.crossOrigin = "anonymous";
+                  player.preload = "none";
+
+                  setStatus("Loading direct HTML audio...");
+                  setInfo(streamUrl);
+
+                  try {
+                    await player.play();
+                    setStatus(title ? "Playing: " + title : "Playing direct HTML audio");
+                  } catch (err) {
+                    console.error("[Receiver] player.play() failed:", err);
+                    setStatus("Play failed");
+                    setInfo(String(err));
+                  }
+                }
+
+                player.addEventListener("loadstart", () => {
+                  console.log("[Receiver] HTML audio loadstart");
+                });
+
+                player.addEventListener("canplay", () => {
+                  console.log("[Receiver] HTML audio canplay");
+                });
+
+                player.addEventListener("playing", () => {
+                  console.log("[Receiver] HTML audio playing");
+                  setStatus("Playing stream");
+                });
+
+                player.addEventListener("waiting", () => {
+                  console.log("[Receiver] HTML audio waiting/buffering");
+                  setStatus("Buffering...");
+                });
+
+                player.addEventListener("stalled", () => {
+                  console.log("[Receiver] HTML audio stalled");
+                  setStatus("Stream stalled");
+                });
+
+                player.addEventListener("error", () => {
+                  const mediaError = player.error;
+                  console.error("[Receiver] HTML audio error:", mediaError);
+                  setStatus("Audio error");
+                  setInfo(mediaError ? "code=" + mediaError.code : "unknown");
+                });
+
+                playerManager.setMessageInterceptor(
+                  cast.framework.messages.MessageType.LOAD,
+                  (loadRequestData) => {
+                    console.log("[Receiver] LOAD intercepted", loadRequestData);
+
+                    const media = loadRequestData && loadRequestData.media;
+                    const customData =
+                      (media && media.customData) ||
+                      loadRequestData.customData ||
+                      null;
+
+                    const streamUrl =
+                      (customData && customData.streamUrl) ||
+                      (media && media.contentId) ||
+                      "";
+
+                    const title =
+                      (customData && customData.title) ||
+                      (media && media.metadata && media.metadata.title) ||
+                      "Analog to WiFi Speakers";
+
+                    console.log("[Receiver] media =", media);
+                    console.log("[Receiver] customData =", customData);
+                    console.log("[Receiver] streamUrl =", streamUrl);
+
+                    if (!streamUrl) {
+                      setStatus("No stream URL received");
+                      setInfo("LOAD came in, but streamUrl was empty");
+                      return null;
+                    }
+
+                    setStatus("Stream URL received");
+                    setInfo(streamUrl);
+
+                    playHtmlAudio(streamUrl, title);
+
+                    // blokkeer de standaard Cast media pipeline
+                    return null;
+                  }
+                );
+
+                playerManager.setMessageInterceptor(
+                  cast.framework.messages.MessageType.STOP,
+                  (requestData) => {
+                    console.log("[Receiver] STOP intercepted");
+                    stopHtmlAudio();
+                    setStatus("Stopped");
+                    setInfo("");
+                    return requestData;
+                  }
+                );
+
+                context.start({
+                  disableIdleTimeout: true
+                });
+
+                setStatus("Receiver ready");
+              </script>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val htmlBytes = html.toByteArray(Charsets.UTF_8)
+
+        val resp = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: text/html; charset=utf-8\r\n")
+            append("Content-Length: ${htmlBytes.size}\r\n")
+            append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
+            append("Pragma: no-cache\r\n")
+            append("Expires: 0\r\n")
+            append("Connection: close\r\n")
+            append("\r\n")
+        }
+
+        out.write(resp.toByteArray(Charsets.UTF_8))
+        out.write(htmlBytes)
+        out.flush()
+    }
+
+    private fun registerLiveAacClient(socket: Socket, out: BufferedOutputStream) {
+        val headers = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: audio/aac\r\n")
+            append("Transfer-Encoding: chunked\r\n")
+            append("Connection: keep-alive\r\n")
+            append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
+            append("Pragma: no-cache\r\n")
+            append("Expires: 0\r\n")
+            append("X-Content-Type-Options: nosniff\r\n")
+            append("\r\n")
+        }
+        out.write(headers.toByteArray(Charsets.UTF_8))
+        out.flush()
+
+        clients.add(Client(socket, out))
+
+        while (running.get() && !socket.isClosed) {
+            try {
+                Thread.sleep(250)
+            } catch (_: Throwable) {
+                break
+            }
+        }
+
+        clients.removeIf { it.socket == socket }
+        try { socket.close() } catch (_: Throwable) {}
+    }
+}
