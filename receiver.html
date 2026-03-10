@@ -1,38 +1,169 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<title>AnalogToWifiSpeakers Receiver</title>
+  <meta charset="utf-8">
+  <title>AnalogToWifiSpeakers Receiver</title>
 
-<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 
-<style>
-body{
-background:black;
-color:white;
-font-family:sans-serif;
-text-align:center;
-margin-top:40vh;
-}
-</style>
+  <style>
+    body {
+      margin: 0;
+      background: black;
+      color: white;
+      font-family: sans-serif;
+      text-align: center;
+    }
 
+    .wrap {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 32px;
+    }
+
+    p {
+      margin: 0;
+      font-size: 20px;
+      opacity: 0.85;
+    }
+
+    audio {
+      width: 420px;
+      max-width: 90vw;
+    }
+
+    .small {
+      font-size: 16px;
+      opacity: 0.65;
+      max-width: 90vw;
+      word-break: break-all;
+    }
+  </style>
 </head>
 
 <body>
+  <div class="wrap">
+    <h2>AnalogToWifiSpeakers Receiver</h2>
+    <p id="status">Waiting for stream...</p>
+    <audio id="player" autoplay controls></audio>
+    <div id="info" class="small"></div>
+  </div>
 
-<h2>AnalogToWifiSpeakers Receiver</h2>
-<p>Waiting for stream...</p>
+  <script>
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+    const player = document.getElementById("player");
+    const statusEl = document.getElementById("status");
+    const infoEl = document.getElementById("info");
 
-<audio id="player" autoplay controls></audio>
+    function setStatus(text) {
+      statusEl.textContent = text;
+      console.log("[Receiver] " + text);
+    }
 
-<script>
+    function setInfo(text) {
+      infoEl.textContent = text || "";
+      if (text) {
+        console.log("[Receiver] " + text);
+      }
+    }
 
-const context = cast.framework.CastReceiverContext.getInstance();
-const playerManager = context.getPlayerManager();
+    function stopHtmlAudio() {
+      try {
+        player.pause();
+      } catch (_) {}
 
-context.start();
+      try {
+        player.removeAttribute("src");
+        player.load();
+      } catch (_) {}
+    }
 
-</script>
+    async function playHtmlAudio(streamUrl, title) {
+      stopHtmlAudio();
 
+      player.src = streamUrl;
+      player.autoplay = true;
+      player.crossOrigin = "anonymous";
+
+      setStatus("Loading direct HTML audio...");
+      setInfo(streamUrl);
+
+      try {
+        await player.play();
+        setStatus(title ? `Playing: ${title}` : "Playing direct HTML audio");
+      } catch (err) {
+        console.error("[Receiver] player.play() failed:", err);
+        setStatus("Play failed");
+        setInfo(String(err));
+      }
+    }
+
+    player.addEventListener("playing", () => {
+      console.log("[Receiver] HTML audio playing");
+    });
+
+    player.addEventListener("waiting", () => {
+      console.log("[Receiver] HTML audio waiting/buffering");
+    });
+
+    player.addEventListener("error", () => {
+      const mediaError = player.error;
+      console.error("[Receiver] HTML audio error:", mediaError);
+      setStatus("Audio error");
+      setInfo(mediaError ? `code=${mediaError.code}` : "unknown");
+    });
+
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.LOAD,
+      (loadRequestData) => {
+        console.log("[Receiver] LOAD intercepted", loadRequestData);
+
+        const customData = loadRequestData && loadRequestData.customData;
+        const media = loadRequestData && loadRequestData.media;
+        const streamUrl =
+          (customData && customData.streamUrl) ||
+          (media && media.contentId) ||
+          "";
+
+        const title =
+          (customData && customData.title) ||
+          (media && media.metadata && media.metadata.title) ||
+          "Analog to WiFi Speakers";
+
+        if (!streamUrl) {
+          setStatus("No stream URL received");
+          setInfo("");
+          return loadRequestData;
+        }
+
+        playHtmlAudio(streamUrl, title);
+
+        return null;
+      }
+    );
+
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.STOP,
+      (requestData) => {
+        console.log("[Receiver] STOP intercepted");
+        stopHtmlAudio();
+        setStatus("Stopped");
+        setInfo("");
+        return requestData;
+      }
+    );
+
+    context.start();
+    setStatus("Receiver ready");
+  </script>
 </body>
 </html>
