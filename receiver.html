@@ -142,10 +142,18 @@
         if (!streamUrl) {
           setStatus("No stream URL received");
           setInfo("");
+          console.log("[Receiver] No stream URL in request", loadRequestData);
           return loadRequestData;
         }
 
+        setStatus("Stream URL received: " + streamUrl);
+        console.log("[Receiver] Stream URL received:", streamUrl);
+
         playHtmlAudio(streamUrl, title);
+
+        setTimeout(() => {
+          setStatus("Playing stream");
+        }, 1000);
 
         return null;
       }
